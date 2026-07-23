@@ -40,16 +40,20 @@
 #include <atomic>
 #include <string>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
 #include <sound_play_msgs/msg/sound_request.hpp>
+#include <sound_play_msgs/action/sound_request.hpp>
+#include <action_msgs/msg/goal_status.hpp>
+#include <action_msgs/msg/goal_status_array.hpp>
 #include <mutex>
 
 namespace sound_play
 {
 
-/** \brief Class that publishes messages to the sound_play node.
+/** \brief Class that sends goals to the sound_play node.
  *
  * This class is a helper class for communicating with the sound_play node
- * via the \ref sound_play::SoundRequest message. It has two ways of being used:
+ * via the \ref sound_play::SoundRequest action. It has two ways of being used:
  *
  * - It can create Sound classes that represent a particular sound which
  *   can be played, repeated or stopped.
@@ -112,29 +116,29 @@ public:
     }
   };
 
-  /** \brief Create a SoundClient that publishes on the given topic
+  /** \brief Create a SoundClient that talks to the given action server
    *
-   * Creates a SoundClient that publishes to the given topic relative to the
-   * given NodeHandle.
+   * Creates a SoundClient that sends goals to the sound_play action server
+   * with the given name, relative to the given NodeHandle.
    *
-   * \param nh Node handle to use when creating the topic.
+   * \param nh Node handle to use when creating the action client.
    *
-   * \param topic Topic to publish to.
+   * \param topic Name of the sound_play action to send goals to.
    */
   SoundClient(rclcpp::Node::SharedPtr nh, const std::string & topic)
   {
     init(nh, topic);
   }
 
-  /** \brief Create a SoundClient with the default topic
+  /** \brief Create a SoundClient with the default action name
    *
-   * Creates a SoundClient that publishes to "robotsound".
+   * Creates a SoundClient that sends goals to the "sound_play" action server.
    *
-   * \param nh Node handle to use when creating the topic.
+   * \param nh Node handle to use when creating the action client.
    */
   SoundClient(rclcpp::Node::SharedPtr nh)
   {
-    init(nh, "robotsound");
+    init(nh, "sound_play");
   }
 
   /** \brief Create a voice Sound.
@@ -348,16 +352,40 @@ public:
 
   /** \brief Stop all currently playing sounds
    *
-   * This method stops all speech, wave file, and built-in sound playback.
+   * Stops all speech, wave file, and built-in sound playback. It
+   * requests cancellation of every goal that is still in flight and sends an
+   * explicit ALL/PLAY_STOP request so that looping sounds are stopped and the
+   * server's playback cache is cleared. Whether an already-playing one-shot
+   * sound is interrupted immediately depends on the sound_play server honouring
+   * the cancellation / processing the stop request while it is playing.
    */
   void stopAll()
   {
+    // Request cancellation of any in-flight goals so the server can preempt an
+    // actively playing sound.
+    action_client_->async_cancel_all_goals();
+    // Send an explicit ALL/PLAY_STOP request so looping sounds are stopped too.
     stop(sound_play_msgs::msg::SoundRequest::ALL);
+  }
+
+  /** \brief Check whether a sound is currently being played.
+   *
+   * Reflects the latest status published by the sound_play action server: it
+   * returns true while a goal issued through this client is accepted or
+   * executing (i.e. a sound is playing), and false otherwise. The status is
+   * refreshed as the node is spun, so the node handle passed to the
+   * constructor must be spun for this value to stay current.
+   *
+   * \return True if a sound is currently being played, false otherwise.
+   */
+  [[nodiscard]] bool isPlaying() const
+  {
+    return playing_;
   }
 
   /** \brief Turns warning messages on or off.
    *
-   * If a message is sent when no node is subscribed to the topic, a
+   * If a goal is sent when the sound_play action server is not available, a
    * warning message is printed. This method can be used to enable or
    * disable warnings.
    *
@@ -369,10 +397,20 @@ public:
   }
 
 private:
-  void init(rclcpp::Node::SharedPtr nh, const std::string &topic)
+  using SoundRequestAction = sound_play_msgs::action::SoundRequest;
+
+  void init(rclcpp::Node::SharedPtr nh, const std::string &action_name)
   {
     nh_ = nh;
-    pub_ = nh->create_publisher<sound_play_msgs::msg::SoundRequest>(topic, 5);
+    action_client_ = rclcpp_action::create_client<SoundRequestAction>(nh, action_name);
+    // Track the action server's goal status so callers can query playback
+    // state via isPlaying(). This matches the QoS of the action status topic.
+    status_sub_ = nh->create_subscription<action_msgs::msg::GoalStatusArray>(
+      action_name + "/_action/status",
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+      [this](const action_msgs::msg::GoalStatusArray::SharedPtr msg) {
+        updateStatus(*msg);
+      });
     quiet_ = false;
   }
 
@@ -393,17 +431,36 @@ private:
       msg.volume = vol;
     }
 
-    pub_->publish(msg);
-
     // TODO: Add this to diagnostics
-    if (pub_->get_subscription_count() == 0 && !quiet_) {
-      RCLCPP_WARN( nh_->get_logger(), "Sound command issued, but no node is subscribed to the topic. Perhaps you forgot to run soundplay_node.py");
+    if (!action_client_->action_server_is_ready() && !quiet_) {
+      RCLCPP_WARN( nh_->get_logger(), "Sound command issued, but the sound_play action server is not available. Perhaps you forgot to run soundplay_node.py");
     }
+
+    // Fire-and-forget: deliver the goal to the action server without blocking.
+    // The result is intentionally not awaited so the public API stays non-blocking.
+    SoundRequestAction::Goal goal;
+    goal.sound_request = msg;
+    action_client_->async_send_goal(goal);
+  }
+
+  void updateStatus(const action_msgs::msg::GoalStatusArray &msg)
+  {
+    for (const auto &status : msg.status_list) {
+      if (status.status == action_msgs::msg::GoalStatus::STATUS_ACCEPTED ||
+        status.status == action_msgs::msg::GoalStatus::STATUS_EXECUTING)
+      {
+        playing_ = true;
+        return;
+      }
+    }
+    playing_ = false;
   }
 
   std::atomic<bool> quiet_{false};
+  std::atomic<bool> playing_{false};
   rclcpp::Node::SharedPtr nh_;
-  rclcpp::Publisher<sound_play_msgs::msg::SoundRequest>::SharedPtr pub_;
+  rclcpp_action::Client<SoundRequestAction>::SharedPtr action_client_;
+  rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr status_sub_;
 };
 
 typedef SoundClient::Sound Sound;

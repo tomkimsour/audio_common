@@ -42,6 +42,6 @@ if(BUILD_TESTING)
 endif()
 
 
-ament_export_dependencies(rosidl_default_runtime sound_play_msgs)
+ament_export_dependencies(rosidl_default_runtime rclcpp_action action_msgs sound_play_msgs)
 
 ament_package()

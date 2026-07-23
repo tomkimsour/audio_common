@@ -25,6 +25,8 @@
    <build_depend>sound_play_msgs</build_depend>
 
    <build_export_depend>rclcpp</build_export_depend>
+   <build_export_depend>rclcpp_action</build_export_depend>
+   <build_export_depend>action_msgs</build_export_depend>
 
    <exec_depend>action_msgs</exec_depend>
    <exec_depend>ament_index_python</exec_depend>
@@ -42,6 +44,8 @@
 
    <test_depend>ament_cmake_gtest</test_depend>
    <test_depend>rclcpp</test_depend>
+   <test_depend>rclcpp_action</test_depend>
+   <test_depend>action_msgs</test_depend>
    <test_depend>sound_play_msgs</test_depend>
 
    <export>
